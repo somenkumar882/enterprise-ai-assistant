@@ -7,25 +7,46 @@ class ElasticsearchClient:
     def __init__(self, host, port, username, password, index_name):
         self.index_name = index_name
         try:
+            # Determine scheme based on host
+            scheme = "http" if host == "localhost" or host.startswith("127.") else "https"
+            
+            # Build connection URL
+            url = f"{scheme}://{host}:{port}"
+            print(f"Attempting to connect to Elasticsearch at {url}...")
+            
+            # Initialize Elasticsearch client
             self.client = Elasticsearch(
-                hosts=[{"host": host, "port": port, "scheme": "https"}],
-                basic_auth=(username, password),
+                [url],
+                basic_auth=(username, password) if username and password else None,
                 verify_certs=False,
-                ssl_show_warn=False
+                request_timeout=10
             )
-            # Test connection
-            if self.client.ping():
-                print(f"Connected to Elasticsearch at {host}:{port}")
-                # Create index if it doesn't exist
-                self._create_index_if_not_exists()
-            else:
-                raise Exception("Failed to ping Elasticsearch")
+            
+            # Test connection with retry logic
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    if self.client.ping():
+                        print(f"Connected to Elasticsearch at {url}")
+                        # Create index if it doesn't exist
+                        self._create_index_if_not_exists()
+                        return
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        print(f"Connection attempt {attempt + 1} failed: {e}. Retrying...")
+                        import time
+                        time.sleep(1)
+                    else:
+                        raise Exception(f"Failed to ping Elasticsearch after {max_retries} attempts: {e}")
+            
+            raise Exception("Failed to ping Elasticsearch")
         except Exception as e:
             raise Exception(f"Failed to connect to Elasticsearch: {e}")
     
     def _create_index_if_not_exists(self):
-        """Create index with basic settings if it doesn't exist"""
+        """Create indexes with basic settings if they don't exist"""
         try:
+            # Create documents index
             if not self.client.indices.exists(index=self.index_name):
                 self.client.indices.create(
                     index=self.index_name,
@@ -43,8 +64,33 @@ class ElasticsearchClient:
                     }
                 )
                 print(f"Created index: {self.index_name}")
+            
+            # Create queries index for storing responses
+            queries_index = f"{self.index_name}-queries"
+            if not self.client.indices.exists(index=queries_index):
+                self.client.indices.create(
+                    index=queries_index,
+                    body={
+                        "settings": {
+                            "number_of_shards": 1,
+                            "number_of_replicas": 0
+                        },
+                        "mappings": {
+                            "properties": {
+                                "query": {"type": "text"},
+                                "answer": {"type": "text"},
+                                "sources": {
+                                    "type": "text"  # Store sources as text array
+                                },
+                                "timestamp": {"type": "date"},
+                                "source_count": {"type": "integer"}
+                            }
+                        }
+                    }
+                )
+                print(f"Created index: {queries_index}")
         except Exception as e:
-            print(f"Warning: Could not create index: {e}")
+            print(f"Warning: Could not create indexes: {e}")
     
     def search(self, search_text, top=3):
         """Search documents in Elasticsearch"""
@@ -177,3 +223,128 @@ def search_documents(query):
     for r in results:
         docs.append(r["content"])
     return docs
+
+def store_query_response(query, answer, sources):
+    """Store query, answer, and sources in Elasticsearch"""
+    try:
+        from datetime import datetime
+        
+        # Ensure sources is a list of strings
+        if not isinstance(sources, list):
+            sources = [sources]
+        
+        document = {
+            "query": query,
+            "answer": answer,
+            "sources": sources,  # Store as array of strings
+            "timestamp": datetime.utcnow().isoformat(),
+            "source_count": len(sources)
+        }
+        
+        if isinstance(client, ElasticsearchClient):
+            # Store in a separate queries index
+            response = client.client.index(
+                index=f"{settings.ELASTICSEARCH_INDEX}-queries",
+                document=document
+            )
+            client.client.indices.refresh(index=f"{settings.ELASTICSEARCH_INDEX}-queries")
+            return response.get("_id", None)
+        else:
+            print("Warning: Response storage only supported with Elasticsearch")
+            return None
+    except Exception as e:
+        print(f"Error storing query response: {e}")
+        return None
+
+def retrieve_query_responses(query_text=None, limit=10):
+    """Retrieve stored query responses from Elasticsearch"""
+    try:
+        if isinstance(client, ElasticsearchClient):
+            index_name = f"{settings.ELASTICSEARCH_INDEX}-queries"
+            
+            if query_text:
+                # Search for similar queries
+                response = client.client.search(
+                    index=index_name,
+                    body={
+                        "query": {
+                            "multi_match": {
+                                "query": query_text,
+                                "fields": ["query", "answer"]
+                            }
+                        },
+                        "size": limit,
+                        "sort": [{"timestamp": {"order": "desc"}}]
+                    }
+                )
+            else:
+                # Get latest responses
+                response = client.client.search(
+                    index=index_name,
+                    body={
+                        "query": {"match_all": {}},
+                        "size": limit,
+                        "sort": [{"timestamp": {"order": "desc"}}]
+                    }
+                )
+            
+            results = []
+            for hit in response["hits"]["hits"]:
+                source = hit["_source"]
+                source["id"] = hit["_id"]
+                results.append(source)
+            
+            return results
+        else:
+            print("Warning: Response retrieval only supported with Elasticsearch")
+            return []
+    except Exception as e:
+        print(f"Error retrieving query responses: {e}")
+        return []
+
+def get_query_response_by_id(response_id):
+    """Retrieve a specific stored query response by ID"""
+    try:
+        if isinstance(client, ElasticsearchClient):
+            response = client.client.get(
+                index=f"{settings.ELASTICSEARCH_INDEX}-queries",
+                id=response_id
+            )
+            return {**response["_source"], "id": response["_id"]}
+        else:
+            return None
+    except Exception as e:
+        print(f"Error retrieving response: {e}")
+        return None
+
+def check_cached_response(query):
+    """Check if a similar query already has a cached response"""
+    try:
+        if isinstance(client, ElasticsearchClient):
+            index_name = f"{settings.ELASTICSEARCH_INDEX}-queries"
+            
+            response = client.client.search(
+                index=index_name,
+                body={
+                    "query": {
+                        "match": {
+                            "query": {
+                                "query": query,
+                                "fuzziness": "AUTO"
+                            }
+                        }
+                    },
+                    "size": 1,
+                    "sort": [{"timestamp": {"order": "desc"}}]
+                }
+            )
+            
+            if response["hits"]["hits"]:
+                hit = response["hits"]["hits"][0]
+                return {**hit["_source"], "id": hit["_id"]}
+            return None
+        else:
+            return None
+    except Exception as e:
+        print(f"Error checking cache: {e}")
+        return None
