@@ -18,12 +18,22 @@ class QueryRequest(BaseModel):
 
 @router.post("/ask")
 async def ask_question(request: QueryRequest):
-    """Ask a question and get an answer with automatic Elasticsearch storage"""
-    query = request.query
+    """
+    Ask a question and get an answer with automatic Elasticsearch storage.
+    
+    The response includes:
+    - answer: Generated answer from OpenAI
+    - sources: Relevant documents used
+    - cached: Whether the response was retrieved from cache
+    - id: Elasticsearch document ID for retrieval
+    - timestamp: When the response was stored
+    """
+    query_text = request.query
+    use_cache = request.use_cache
     
     # Check cache first if enabled
-    if request.use_cache:
-        cached = check_cached_response(query)
+    if use_cache:
+        cached = check_cached_response(query_text)
         if cached:
             return {
                 "answer": cached["answer"],
@@ -34,19 +44,24 @@ async def ask_question(request: QueryRequest):
             }
     
     # Search for relevant documents
-    docs = search_documents(query)
+    docs = search_documents(query_text)
     
     # Generate answer using OpenAI
-    answer = generate_answer(query, docs)
+    answer = generate_answer(query_text, docs)
     
     # Store in Elasticsearch
-    response_id = store_query_response(query, answer, docs)
+    response_id = store_query_response(query_text, answer, docs)
+    
+    # Get the timestamp from the stored response
+    stored_response = get_query_response_by_id(response_id) if response_id else None
+    timestamp = stored_response.get("timestamp") if stored_response else None
     
     return {
         "answer": answer,
         "sources": docs,
         "cached": False,
-        "id": response_id
+        "id": response_id,
+        "timestamp": timestamp
     }
 
 @router.get("/query-history")
